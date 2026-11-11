@@ -1,0 +1,10 @@
+{
+  "id": "synology-quicksync-plus",
+  "name": "Synology QuickSync Plus",
+  "version": "1.3.7",
+  "minAppVersion": "1.6.6",
+  "description": "通过 QuickConnect 与 File Station 接口把库同步到群晖 NAS，支持手机与电脑，冲突可收敛。",
+  "author": "ifascloud",
+  "authorUrl": "https://github.com/ifascloud",
+  "isDesktopOnly": false
+}

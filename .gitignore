@@ -1,0 +1,7 @@
+node_modules/
+.superpowers/
+.agents/
+.DS_Store
+Thumbs.db
+*.js.map
+.backup/

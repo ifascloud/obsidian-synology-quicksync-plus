@@ -1,0 +1,31 @@
+{
+  "name": "synology-quicksync-plus",
+  "version": "1.3.7",
+  "description": "通过 QuickConnect 与 File Station 接口把 Obsidian 库同步到群晖 NAS，支持手机与电脑，冲突可收敛（synology-quicksync 的修复分支）。",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "synology",
+    "nas",
+    "sync",
+    "quickconnect"
+  ],
+  "author": "hope",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "esbuild": "^0.20.0",
+    "obsidian": "latest",
+    "tslib": "^2.6.2",
+    "typescript": "^5.3.3",
+    "vitest": "^1.2.0"
+  }
+}
