@@ -874,7 +874,14 @@ function computeDiff(localFiles, remoteFiles, ignorePatterns, lastSyncIndex) {
 }
 
 // src/sync/sync-manager.ts
+var PERSIST_EVERY = 25;
 var CONCURRENCY_LIMIT = 3;
+var SESSION_ERROR_CODES = ["105", "106", "107", "119"];
+function isSessionError(message) {
+  return SESSION_ERROR_CODES.some(
+    (code) => message.includes(`（错误码 ${code}）`) || message.includes(`错误码 ${code}`) || message.includes(`code ${code}`)
+  );
+}
 async function runConcurrent(items, limit, fn) {
   if (items.length === 0)
     return;
@@ -890,19 +897,50 @@ async function runConcurrent(items, limit, fn) {
   await Promise.all(workers);
 }
 var SyncManager = class {
-  constructor(client, vault, remoteRoot, currentIndex, refreshRemote) {
+  constructor(client, vault, remoteRoot, currentIndex, refreshRemote, hooks) {
     this.isRunning = false;
+    this.doneSincePersist = 0;
     this.client = client;
     this.vault = vault;
     this.remoteRoot = remoteRoot.replace(/\/+$/, "");
     this.currentIndex = currentIndex ? { ...currentIndex } : {};
     this.refreshRemote = refreshRemote;
+    this.hooks = hooks || {};
   }
   async statOrNull(path) {
     try {
       return await this.vault.stat(path);
     } catch {
       return null;
+    }
+  }
+  /** 调用远端接口；会话过期时重新登录并重试一次，避免长任务中途整段失败。 */
+  async callWithRelogin(fn) {
+    try {
+      return await fn();
+    } catch (e) {
+      const msg = e?.message || String(e);
+      if (this.hooks.relogin && isSessionError(msg)) {
+        await this.hooks.relogin();
+        return await fn();
+      }
+      throw e;
+    }
+  }
+  /** 上报进度，并按固定间隔把当前索引持久化，保证中断后可续。 */
+  noteProgress(done, total, phase, updatedIndex) {
+    try {
+      this.hooks.onProgress?.(done, total, phase);
+    } catch {
+    }
+    if (!this.hooks.persist)
+      return;
+    this.doneSincePersist += 1;
+    if (this.doneSincePersist >= PERSIST_EVERY) {
+      this.doneSincePersist = 0;
+      const snapshot = { ...updatedIndex };
+      void this.hooks.persist(snapshot).catch(() => {
+      });
     }
   }
   async executeSync(diff) {
@@ -923,57 +961,65 @@ var SyncManager = class {
     };
     try {
       const uploads = diff.uploads || [];
+      let uploadDone = 0;
       await runConcurrent(uploads, CONCURRENCY_LIMIT, async (item) => {
         try {
           const content = await this.vault.readBinary(item.path);
           const slashIdx = item.path.lastIndexOf("/");
           const folder = slashIdx !== -1 ? `${this.remoteRoot}/${item.path.substring(0, slashIdx)}` : this.remoteRoot;
           const fileName = slashIdx !== -1 ? item.path.substring(slashIdx + 1) : item.path;
-          if (item.local?.mtime !== void 0) {
-            await this.client.uploadFile(folder, fileName, content, item.local.mtime);
+          const localMtime = item.local?.mtime;
+          if (localMtime !== void 0) {
+            await this.callWithRelogin(() => this.client.uploadFile(folder, fileName, content, localMtime));
           } else {
-            await this.client.uploadFile(folder, fileName, content);
+            await this.callWithRelogin(() => this.client.uploadFile(folder, fileName, content));
           }
           report.uploadedCount++;
           const st = await this.statOrNull(item.path);
           recordBaseline(updatedIndex, item.path, {
-            localMtime: st?.mtime ?? item.local?.mtime ?? Date.now(),
+            localMtime: st?.mtime ?? localMtime ?? Date.now(),
             localSize: st?.size ?? content.byteLength,
-            remoteMtime: st?.mtime ?? item.local?.mtime ?? Date.now(),
+            remoteMtime: st?.mtime ?? localMtime ?? Date.now(),
             remoteSize: st?.size ?? content.byteLength,
             md5: item.local?.md5
           });
           touched.add(item.path);
+          this.noteProgress(++uploadDone, uploads.length, "上传", updatedIndex);
         } catch (e) {
           report.errors.push({ path: item.path, error: e.message || String(e) });
         }
       });
       const downloads = diff.downloads || [];
+      let downloadDone = 0;
       await runConcurrent(downloads, CONCURRENCY_LIMIT, async (item) => {
         if (!item.remote)
           return;
         try {
-          const content = await this.client.downloadFile(item.remote.fullRemotePath);
+          const remote = item.remote;
+          const content = await this.callWithRelogin(() => this.client.downloadFile(remote.fullRemotePath));
           await this.vault.writeBinaryAtomic(item.path, content);
           report.downloadedCount++;
           const st = await this.statOrNull(item.path);
           recordBaseline(updatedIndex, item.path, {
             localMtime: st?.mtime ?? Date.now(),
             localSize: st?.size ?? content.byteLength,
-            remoteMtime: item.remote.mtime,
-            remoteSize: item.remote.size,
-            md5: item.remote.md5
+            remoteMtime: remote.mtime,
+            remoteSize: remote.size,
+            md5: remote.md5
           });
+          this.noteProgress(++downloadDone, downloads.length, "下载", updatedIndex);
         } catch (e) {
           report.errors.push({ path: item.path, error: e.message || String(e) });
         }
       });
       const conflicts = diff.conflicts || [];
+      let conflictDone = 0;
       for (const item of conflicts) {
         if (!item.remote)
           continue;
         try {
-          const content = await this.client.downloadFile(item.remote.fullRemotePath);
+          const remote = item.remote;
+          const content = await this.callWithRelogin(() => this.client.downloadFile(remote.fullRemotePath));
           const timestamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-").slice(0, 19);
           const slashIdx = item.path.lastIndexOf("/");
           const dir = slashIdx !== -1 ? item.path.substring(0, slashIdx + 1) : "";
@@ -988,21 +1034,24 @@ var SyncManager = class {
           recordBaseline(updatedIndex, item.path, {
             localMtime: st?.mtime ?? item.local?.mtime ?? Date.now(),
             localSize: st?.size ?? item.local?.size ?? content.byteLength,
-            remoteMtime: item.remote.mtime,
-            remoteSize: item.remote.size,
-            md5: item.remote.md5
+            remoteMtime: remote.mtime,
+            remoteSize: remote.size,
+            md5: remote.md5
           });
+          this.noteProgress(++conflictDone, conflicts.length, "冲突", updatedIndex);
         } catch (e) {
           report.errors.push({ path: item.path, error: e.message || String(e) });
         }
       }
       const deletesRemote = diff.deletesRemote || [];
+      let deleteRemoteDone = 0;
       for (const item of deletesRemote) {
         try {
           const fullPath = item.remote?.fullRemotePath || `${this.remoteRoot}/${item.path}`;
-          await this.client.deleteFile(fullPath);
+          await this.callWithRelogin(() => this.client.deleteFile(fullPath));
           delete updatedIndex[item.path];
           report.deletedRemoteCount++;
+          this.noteProgress(++deleteRemoteDone, deletesRemote.length, "删除", updatedIndex);
         } catch (e) {
           report.errors.push({ path: item.path, error: e.message || String(e) });
         }
@@ -1044,6 +1093,10 @@ var SyncManager = class {
           report.errors.push({ path: "*", error: `Remote refresh failed: ${e?.message || String(e)}` });
         }
       }
+      try {
+        this.hooks.onProgress?.(0, 0, "完成");
+      } catch {
+      }
     } finally {
       this.isRunning = false;
     }
@@ -1052,6 +1105,7 @@ var SyncManager = class {
 };
 
 // src/main.ts
+var REQUEST_TIMEOUT_MS = 12e4;
 var SynologySyncPlugin = class extends import_obsidian2.Plugin {
   constructor() {
     super(...arguments);
@@ -1147,7 +1201,7 @@ var SynologySyncPlugin = class extends import_obsidian2.Plugin {
     if (state === "idle") {
       this.statusBarEl.setText(text ? `✓ 群晖：${text}` : "✓ 群晖：就绪");
     } else if (state === "syncing") {
-      this.statusBarEl.setText("⏳ 群晖：同步中…");
+      this.statusBarEl.setText(text ? `⏳ 群晖：${text}` : "⏳ 群晖：同步中…");
     } else if (state === "error") {
       this.statusBarEl.setText("✗ 群晖：出错");
     } else if (state === "partial-error") {
@@ -1231,15 +1285,28 @@ var SynologySyncPlugin = class extends import_obsidian2.Plugin {
         body: options.body,
         throw: false
       };
-      const res = await (0, import_obsidian2.requestUrl)(param);
-      const parsedJson = this.parseJsonResponse(res);
-      return {
-        status: res.status,
-        headers: res.headers,
-        json: parsedJson,
-        text: res.text,
-        arrayBuffer: res.arrayBuffer
-      };
+      let timer = null;
+      const timeoutPromise = new Promise((_, reject) => {
+        timer = window.setTimeout(
+          () => reject(new Error(`请求超时（${REQUEST_TIMEOUT_MS / 1e3} 秒无响应），该项已跳过，下次同步会重试`)),
+          REQUEST_TIMEOUT_MS
+        );
+      });
+      try {
+        const res = await Promise.race([(0, import_obsidian2.requestUrl)(param), timeoutPromise]);
+        const parsedJson = this.parseJsonResponse(res);
+        return {
+          status: res.status,
+          headers: res.headers,
+          json: parsedJson,
+          text: res.text,
+          arrayBuffer: res.arrayBuffer
+        };
+      } finally {
+        if (timer !== null) {
+          window.clearTimeout(timer);
+        }
+      }
     };
   }
   getVaultAdapter() {
@@ -1344,7 +1411,7 @@ var SynologySyncPlugin = class extends import_obsidian2.Plugin {
       return;
     }
     this.isSyncing = true;
-    this.setStatusBar("syncing");
+    this.setStatusBar("syncing", "准备中…");
     try {
       let client = await this.getAuthenticatedClient();
       let remoteFiles;
@@ -1367,8 +1434,14 @@ var SynologySyncPlugin = class extends import_obsidian2.Plugin {
         `${this.app.vault.configDir}/**`
       ];
       const diff = computeDiff(localFiles, remoteFiles, effectiveIgnore, this.syncIndex);
+      const totalWork = diff.uploads.length + diff.downloads.length + diff.conflicts.length + diff.deletesRemote.length;
+      if (totalWork > 0) {
+        this.setStatusBar("syncing", `0/${totalWork}…`);
+        new import_obsidian2.Notice(`开始同步：待处理 ${totalWork} 项`, 4e3);
+      }
+      const activeClient = client;
       const refreshRemote = async () => {
-        const files = await client.listFiles(this.settings.remotePath);
+        const files = await activeClient.listFiles(this.settings.remotePath);
         const map = /* @__PURE__ */ new Map();
         for (const f of files) {
           if (!f.isdir)
@@ -1376,12 +1449,31 @@ var SynologySyncPlugin = class extends import_obsidian2.Plugin {
         }
         return map;
       };
+      const hooks = {
+        onProgress: (done, total, phase) => {
+          if (phase === "完成") {
+            this.setStatusBar("syncing", "收尾中…");
+            return;
+          }
+          this.setStatusBar("syncing", `${phase} ${done}/${total}`);
+        },
+        // 中途落盘：手机被系统挂起、App 被切后台或网络中断后，不必从零重来
+        persist: async (index) => {
+          this.syncIndex = index;
+          await this.saveSettings();
+        },
+        relogin: async () => {
+          this.activeClient = null;
+          await this.getAuthenticatedClient();
+        }
+      };
       const manager = new SyncManager(
         client,
         this.getVaultAdapter(),
         this.settings.remotePath,
         this.syncIndex,
-        refreshRemote
+        refreshRemote,
+        hooks
       );
       const report = await manager.executeSync(diff);
       if (report.updatedIndex) {
@@ -1421,7 +1513,7 @@ var SynologySyncPlugin = class extends import_obsidian2.Plugin {
     } catch (e) {
       this.setStatusBar("error");
       const msg = e instanceof Error ? e.message : String(e);
-      new import_obsidian2.Notice(`同步失败：${msg}`);
+      new import_obsidian2.Notice(`同步失败：${msg}`, 1e4);
       console.error("[群晖同步]", e);
       this.activeClient = null;
     } finally {

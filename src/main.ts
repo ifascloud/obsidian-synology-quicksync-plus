@@ -4,7 +4,10 @@ import { SynologySyncSettingTab } from './settings/settings-tab';
 import { QuickConnectResolver } from './syno/qc-resolver';
 import { SynologyApiClient, HttpRequester } from './syno/api-client';
 import { computeDiff } from './sync/diff-engine';
-import { SyncManager, VaultAdapter } from './sync/sync-manager';
+import { SyncManager, VaultAdapter, SyncHooks } from './sync/sync-manager';
+
+/** 单次 HTTP 请求上限：手机网络切换/中继断流时避免整个同步无限期挂住。 */
+const REQUEST_TIMEOUT_MS = 120_000;
 
 export default class SynologySyncPlugin extends Plugin {
   settings: SynoSyncSettings = DEFAULT_SETTINGS;
@@ -119,7 +122,7 @@ export default class SynologySyncPlugin extends Plugin {
     if (state === 'idle') {
       this.statusBarEl.setText(text ? `✓ 群晖：${text}` : '✓ 群晖：就绪');
     } else if (state === 'syncing') {
-      this.statusBarEl.setText('⏳ 群晖：同步中…');
+      this.statusBarEl.setText(text ? `⏳ 群晖：${text}` : '⏳ 群晖：同步中…');
     } else if (state === 'error') {
       this.statusBarEl.setText('✗ 群晖：出错');
     } else if (state === 'partial-error') {
@@ -210,15 +213,30 @@ export default class SynologySyncPlugin extends Plugin {
         body: options.body as any,
         throw: false,
       };
-      const res = await requestUrl(param);
-      const parsedJson = this.parseJsonResponse(res);
-      return {
-        status: res.status,
-        headers: res.headers,
-        json: parsedJson,
-        text: res.text,
-        arrayBuffer: res.arrayBuffer,
-      };
+
+      let timer: number | null = null;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = window.setTimeout(
+          () => reject(new Error(`请求超时（${REQUEST_TIMEOUT_MS / 1000} 秒无响应），该项已跳过，下次同步会重试`)),
+          REQUEST_TIMEOUT_MS
+        );
+      });
+
+      try {
+        const res = await Promise.race([requestUrl(param), timeoutPromise]);
+        const parsedJson = this.parseJsonResponse(res);
+        return {
+          status: res.status,
+          headers: res.headers,
+          json: parsedJson,
+          text: res.text,
+          arrayBuffer: res.arrayBuffer,
+        };
+      } finally {
+        if (timer !== null) {
+          window.clearTimeout(timer);
+        }
+      }
     };
   }
 
@@ -273,7 +291,7 @@ export default class SynologySyncPlugin extends Plugin {
 
   private async getLocalFiles(): Promise<LocalFileItem[]> {
     const files = this.app.vault.getFiles();
-    return files.map(f => ({
+    return files.map((f) => ({
       path: f.path,
       mtime: f.stat.mtime,
       size: f.stat.size,
@@ -337,12 +355,13 @@ export default class SynologySyncPlugin extends Plugin {
     }
 
     this.isSyncing = true;
-    this.setStatusBar('syncing');
+    this.setStatusBar('syncing', '准备中…');
 
     try {
       let client = await this.getAuthenticatedClient();
 
-      let remoteFiles;
+      // 首次清理远端目录结构前，也要先刷新一次索引基线
+      let remoteFiles: RemoteFileItem[];
       try {
         remoteFiles = await client.listFiles(this.settings.remotePath);
       } catch (err: unknown) {
@@ -369,9 +388,20 @@ export default class SynologySyncPlugin extends Plugin {
       ];
       const diff = computeDiff(localFiles, remoteFiles, effectiveIgnore, this.syncIndex);
 
+      const totalWork =
+        diff.uploads.length +
+        diff.downloads.length +
+        diff.conflicts.length +
+        diff.deletesRemote.length;
+      if (totalWork > 0) {
+        this.setStatusBar('syncing', `0/${totalWork}…`);
+        new Notice(`开始同步：待处理 ${totalWork} 项`, 4000);
+      }
+
       // 3. Execute sync
+      const activeClient = client;
       const refreshRemote = async (): Promise<Map<string, RemoteFileItem>> => {
-        const files = await client.listFiles(this.settings.remotePath);
+        const files = await activeClient.listFiles(this.settings.remotePath);
         const map = new Map<string, RemoteFileItem>();
         for (const f of files) {
           if (!f.isdir) map.set(f.path, f);
@@ -379,12 +409,32 @@ export default class SynologySyncPlugin extends Plugin {
         return map;
       };
 
+      const hooks: SyncHooks = {
+        onProgress: (done, total, phase) => {
+          if (phase === '完成') {
+            this.setStatusBar('syncing', '收尾中…');
+            return;
+          }
+          this.setStatusBar('syncing', `${phase} ${done}/${total}`);
+        },
+        // 中途落盘：手机被系统挂起、App 被切后台或网络中断后，不必从零重来
+        persist: async (index) => {
+          this.syncIndex = index;
+          await this.saveSettings();
+        },
+        relogin: async () => {
+          this.activeClient = null;
+          await this.getAuthenticatedClient();
+        },
+      };
+
       const manager = new SyncManager(
         client,
         this.getVaultAdapter(),
         this.settings.remotePath,
         this.syncIndex,
-        refreshRemote
+        refreshRemote,
+        hooks
       );
       const report = await manager.executeSync(diff);
 
@@ -423,7 +473,7 @@ export default class SynologySyncPlugin extends Plugin {
     } catch (e: unknown) {
       this.setStatusBar('error');
       const msg = e instanceof Error ? e.message : String(e);
-      new Notice(`同步失败：${msg}`);
+      new Notice(`同步失败：${msg}`, 10000);
       console.error('[群晖同步]', e);
       // 若是网络不可达或关键错误，重置缓存以便下次重新探活
       this.activeClient = null;

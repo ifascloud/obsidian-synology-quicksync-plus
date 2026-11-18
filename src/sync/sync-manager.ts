@@ -25,10 +25,32 @@ export interface SyncReport {
   updatedIndex?: SyncIndex;
 }
 
+export type SyncPhase = '上传' | '下载' | '冲突' | '删除';
+
+export interface SyncHooks {
+  /** 每处理完一项回调一次，用于状态栏进度，避免长时间同步看起来像卡死。 */
+  onProgress?: (done: number, total: number, phase: SyncPhase | '完成') => void;
+  /** 每 PERSIST_EVERY 项把索引落盘一次：手机被系统挂起或退出后不必从零重来。 */
+  persist?: (index: SyncIndex) => Promise<void>;
+  /** 会话过期（DSM 105/106/107/119）时重新登录，返回后重试当前项。 */
+  relogin?: () => Promise<void>;
+}
+
+const PERSIST_EVERY = 25;
+const CONCURRENCY_LIMIT = 3;
+const SESSION_ERROR_CODES = ['105', '106', '107', '119'];
+
+function isSessionError(message: string): boolean {
+  return SESSION_ERROR_CODES.some(
+    (code) =>
+      message.includes(`（错误码 ${code}）`) ||
+      message.includes(`错误码 ${code}`) ||
+      message.includes(`code ${code}`)
+  );
+}
+
 /** Returns the remote tree keyed by vault-relative path. */
 export type RemoteRefresh = () => Promise<Map<string, RemoteFileItem>>;
-
-const CONCURRENCY_LIMIT = 3;
 
 async function runConcurrent<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
   if (items.length === 0) return;
@@ -51,19 +73,23 @@ export class SyncManager {
   private currentIndex: SyncIndex;
   private refreshRemote?: RemoteRefresh;
   private isRunning: boolean = false;
+  private hooks: SyncHooks;
+  private doneSincePersist = 0;
 
   constructor(
     client: SynologyApiClient,
     vault: VaultAdapter,
     remoteRoot: string,
     currentIndex?: SyncIndex,
-    refreshRemote?: RemoteRefresh
+    refreshRemote?: RemoteRefresh,
+    hooks?: SyncHooks
   ) {
     this.client = client;
     this.vault = vault;
     this.remoteRoot = remoteRoot.replace(/\/+$/, '');
     this.currentIndex = currentIndex ? { ...currentIndex } : {};
     this.refreshRemote = refreshRemote;
+    this.hooks = hooks || {};
   }
 
   private async statOrNull(path: string): Promise<VaultStat | null> {
@@ -71,6 +97,38 @@ export class SyncManager {
       return await this.vault.stat(path);
     } catch {
       return null;
+    }
+  }
+
+  /** 调用远端接口；会话过期时重新登录并重试一次，避免长任务中途整段失败。 */
+  private async callWithRelogin<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      if (this.hooks.relogin && isSessionError(msg)) {
+        await this.hooks.relogin();
+        return await fn();
+      }
+      throw e;
+    }
+  }
+
+  /** 上报进度，并按固定间隔把当前索引持久化，保证中断后可续。 */
+  private noteProgress(done: number, total: number, phase: SyncPhase, updatedIndex: SyncIndex): void {
+    try {
+      this.hooks.onProgress?.(done, total, phase);
+    } catch {
+      // 进度回调不应影响同步本身
+    }
+    if (!this.hooks.persist) return;
+    this.doneSincePersist += 1;
+    if (this.doneSincePersist >= PERSIST_EVERY) {
+      this.doneSincePersist = 0;
+      const snapshot: SyncIndex = { ...updatedIndex };
+      void this.hooks.persist(snapshot).catch(() => {
+        // 落盘失败不阻断同步，最后一轮结束还会再存一次
+      });
     }
   }
 
@@ -96,17 +154,19 @@ export class SyncManager {
     try {
       // 1. Uploads
       const uploads = diff.uploads || [];
+      let uploadDone = 0;
       await runConcurrent(uploads, CONCURRENCY_LIMIT, async (item) => {
         try {
           const content = await this.vault.readBinary(item.path);
           const slashIdx = item.path.lastIndexOf('/');
           const folder = slashIdx !== -1 ? `${this.remoteRoot}/${item.path.substring(0, slashIdx)}` : this.remoteRoot;
           const fileName = slashIdx !== -1 ? item.path.substring(slashIdx + 1) : item.path;
+          const localMtime = item.local?.mtime;
 
-          if (item.local?.mtime !== undefined) {
-            await this.client.uploadFile(folder, fileName, content, item.local.mtime);
+          if (localMtime !== undefined) {
+            await this.callWithRelogin(() => this.client.uploadFile(folder, fileName, content, localMtime));
           } else {
-            await this.client.uploadFile(folder, fileName, content);
+            await this.callWithRelogin(() => this.client.uploadFile(folder, fileName, content));
           }
           report.uploadedCount++;
 
@@ -114,13 +174,14 @@ export class SyncManager {
           // filled in by the post-transfer refresh below.
           const st = await this.statOrNull(item.path);
           recordBaseline(updatedIndex, item.path, {
-            localMtime: st?.mtime ?? item.local?.mtime ?? Date.now(),
+            localMtime: st?.mtime ?? localMtime ?? Date.now(),
             localSize: st?.size ?? content.byteLength,
-            remoteMtime: st?.mtime ?? item.local?.mtime ?? Date.now(),
+            remoteMtime: st?.mtime ?? localMtime ?? Date.now(),
             remoteSize: st?.size ?? content.byteLength,
             md5: item.local?.md5,
           });
           touched.add(item.path);
+          this.noteProgress(++uploadDone, uploads.length, '上传', updatedIndex);
         } catch (e: any) {
           report.errors.push({ path: item.path, error: e.message || String(e) });
         }
@@ -128,10 +189,12 @@ export class SyncManager {
 
       // 2. Downloads
       const downloads = diff.downloads || [];
+      let downloadDone = 0;
       await runConcurrent(downloads, CONCURRENCY_LIMIT, async (item) => {
         if (!item.remote) return;
         try {
-          const content = await this.client.downloadFile(item.remote.fullRemotePath);
+          const remote = item.remote;
+          const content = await this.callWithRelogin(() => this.client.downloadFile(remote.fullRemotePath));
           await this.vault.writeBinaryAtomic(item.path, content);
           report.downloadedCount++;
 
@@ -139,10 +202,11 @@ export class SyncManager {
           recordBaseline(updatedIndex, item.path, {
             localMtime: st?.mtime ?? Date.now(),
             localSize: st?.size ?? content.byteLength,
-            remoteMtime: item.remote.mtime,
-            remoteSize: item.remote.size,
-            md5: item.remote.md5,
+            remoteMtime: remote.mtime,
+            remoteSize: remote.size,
+            md5: remote.md5,
           });
+          this.noteProgress(++downloadDone, downloads.length, '下载', updatedIndex);
         } catch (e: any) {
           report.errors.push({ path: item.path, error: e.message || String(e) });
         }
@@ -153,10 +217,12 @@ export class SyncManager {
       //    otherwise the next cycle re-detects the same conflict and produces a
       //    copy of the copy (this is the loop that filled a vault with 1190 files).
       const conflicts = diff.conflicts || [];
+      let conflictDone = 0;
       for (const item of conflicts) {
         if (!item.remote) continue;
         try {
-          const content = await this.client.downloadFile(item.remote.fullRemotePath);
+          const remote = item.remote;
+          const content = await this.callWithRelogin(() => this.client.downloadFile(remote.fullRemotePath));
           const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
           const slashIdx = item.path.lastIndexOf('/');
           const dir = slashIdx !== -1 ? item.path.substring(0, slashIdx + 1) : '';
@@ -174,10 +240,11 @@ export class SyncManager {
           recordBaseline(updatedIndex, item.path, {
             localMtime: st?.mtime ?? item.local?.mtime ?? Date.now(),
             localSize: st?.size ?? item.local?.size ?? content.byteLength,
-            remoteMtime: item.remote.mtime,
-            remoteSize: item.remote.size,
-            md5: item.remote.md5,
+            remoteMtime: remote.mtime,
+            remoteSize: remote.size,
+            md5: remote.md5,
           });
+          this.noteProgress(++conflictDone, conflicts.length, '冲突', updatedIndex);
         } catch (e: any) {
           report.errors.push({ path: item.path, error: e.message || String(e) });
         }
@@ -185,12 +252,14 @@ export class SyncManager {
 
       // 4. Remote deletions (deleted locally -> delete remotely)
       const deletesRemote = diff.deletesRemote || [];
+      let deleteRemoteDone = 0;
       for (const item of deletesRemote) {
         try {
           const fullPath = item.remote?.fullRemotePath || `${this.remoteRoot}/${item.path}`;
-          await this.client.deleteFile(fullPath);
+          await this.callWithRelogin(() => this.client.deleteFile(fullPath));
           delete updatedIndex[item.path];
           report.deletedRemoteCount++;
+          this.noteProgress(++deleteRemoteDone, deletesRemote.length, '删除', updatedIndex);
         } catch (e: any) {
           report.errors.push({ path: item.path, error: e.message || String(e) });
         }
@@ -242,6 +311,12 @@ export class SyncManager {
           report.errors.push({ path: '*', error: `Remote refresh failed: ${e?.message || String(e)}` });
         }
       }
+
+      try {
+        this.hooks.onProgress?.(0, 0, '完成');
+      } catch {
+        // 忽略进度回调异常
+      }
     } finally {
       this.isRunning = false;
     }
@@ -256,8 +331,9 @@ export async function executeSyncCycle(
   remoteRoot: string,
   diff: DiffResult,
   currentIndex?: SyncIndex,
-  refreshRemote?: RemoteRefresh
+  refreshRemote?: RemoteRefresh,
+  hooks?: SyncHooks
 ): Promise<SyncReport> {
-  const manager = new SyncManager(client, vault, remoteRoot, currentIndex, refreshRemote);
+  const manager = new SyncManager(client, vault, remoteRoot, currentIndex, refreshRemote, hooks);
   return await manager.executeSync(diff);
 }
