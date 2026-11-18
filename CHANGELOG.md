@@ -1,5 +1,12 @@
 # 更新记录
 
+## 1.3.8
+
+- **修复 `SYNO.FileStation.List` 的 `additional` 参数格式**：改为群晖 DSM 要求的 JSON 数组字符串 `["time","size"]`（URL 编码），修复远端 `mtime` 与 `size` 全返回 `0`、导致远端修改永远无法增量下载的协议 Bug。
+- **修复 `SYNO.FileStation.Upload` 的 `mtime` 单位**：改为传毫秒时间戳，修复以前传秒级被 DSM 除以 1000 变成 1970-01-21 的问题。
+- **旧基线平滑迁移**：对 `remoteMtime === 0 && remoteSize === 0` 的存量索引条目自动按 `remote.size !== last.size` 判定远端变更并在本轮回填真实远端元数据，避免升级后整库误触发全量重下或冲突风暴；同步清理双端均已消失的陈旧索引键。
+- **内网 HTTPS 优先**：QuickConnect 自动发现内网 IP 时优先尝试 `https://...:5001`，失败再回退 `http://...:5000`。
+
 ## 1.3.7
 
 - 示例值与占位符统一改为 `my-nas` / `your-name`，仓库与构建产物中不含任何真实账号、地址或 QuickConnect ID

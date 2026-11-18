@@ -76,8 +76,8 @@ export class QuickConnectResolver {
           const directCandidates: string[] = [];
 
           for (const ip of info.lanIps) {
-            directCandidates.push(`http://${ip}:${info.httpPort}`);
             directCandidates.push(`https://${ip}:${info.httpsPort}`);
+            directCandidates.push(`http://${ip}:${info.httpPort}`);
           }
 
           if (info.smartDnsLan) {

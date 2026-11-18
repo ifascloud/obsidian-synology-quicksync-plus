@@ -118,7 +118,8 @@ export class SynologyApiClient {
 
     // 分页获取目录下所有条目（处理群晖默认单页限制）
     while (true) {
-      const url = `${this.baseUrl}/webapi/entry.cgi?api=SYNO.FileStation.List&version=2&method=list&folder_path=${encodeURIComponent(folderToQuery)}&offset=${offset}&limit=${limit}&additional=time,size,md5&_sid=${this.sid}`;
+      const additionalParam = encodeURIComponent('["time","size"]');
+      const url = `${this.baseUrl}/webapi/entry.cgi?api=SYNO.FileStation.List&version=2&method=list&folder_path=${encodeURIComponent(folderToQuery)}&offset=${offset}&limit=${limit}&additional=${additionalParam}&_sid=${encodeURIComponent(this.sid)}`;
       const res = await this.http({ url, method: 'GET' });
       const json = res.json;
 
@@ -189,9 +190,9 @@ export class SynologyApiClient {
 
     let mtimePart = '';
     if (typeof mtimeMs === 'number' && mtimeMs > 0) {
-      // 群晖 FileStation Upload API 支持秒级或毫秒级时间戳
-      const sec = Math.floor(mtimeMs > 10000000000 ? mtimeMs / 1000 : mtimeMs);
-      mtimePart = `--${boundary}\r\nContent-Disposition: form-data; name="mtime"\r\n\r\n${sec}\r\n`;
+      // 群晖 SYNO.FileStation.Upload 的 mtime 参数单位固定为毫秒（传秒会被 DSM 除以 1000 变成 1970 年）
+      const ms = Math.floor(mtimeMs > 10000000000 ? mtimeMs : mtimeMs * 1000);
+      mtimePart = `--${boundary}\r\nContent-Disposition: form-data; name="mtime"\r\n\r\n${ms}\r\n`;
     }
 
     // Build multipart body

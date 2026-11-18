@@ -388,8 +388,20 @@ export default class SynologySyncPlugin extends Plugin {
       );
       const report = await manager.executeSync(diff);
 
-      // 4. Update and persist syncIndex
+      // 4. Update and persist syncIndex (prune stale entries absent from both local and remote)
       if (report.updatedIndex) {
+        const activePaths = new Set<string>();
+        for (const f of localFiles) activePaths.add(f.path);
+        for (const f of remoteFiles) {
+          if (!f.isdir) activePaths.add(f.path);
+        }
+        for (const item of diff.uploads) activePaths.add(item.path);
+        for (const item of diff.downloads) activePaths.add(item.path);
+        for (const key of Object.keys(report.updatedIndex)) {
+          if (!activePaths.has(key)) {
+            delete report.updatedIndex[key];
+          }
+        }
         this.syncIndex = report.updatedIndex;
         await this.saveSettings();
       }

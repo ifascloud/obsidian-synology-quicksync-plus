@@ -75,6 +75,14 @@ function changedSince(
   return !sameMtime(mtime, lastMtime) || sizeChanged;
 }
 
+/**
+ * Legacy baselines produced before 1.3.8 had remoteMtime=0 and remoteSize=0
+ * because FileStation.List did not receive JSON-encoded additional=["time","size"].
+ */
+function isLegacyEmptyRemoteBaseline(last: SyncIndex[string]): boolean {
+  return last.remoteMtime === 0 && (last.remoteSize ?? 0) === 0;
+}
+
 export function computeDiff(
   localFiles: LocalFileItem[],
   remoteFiles: RemoteFileItem[],
@@ -136,14 +144,16 @@ export function computeDiff(
       if (last) {
         // 3-way comparison against the last sync baseline
         const localChanged = changedSince(local.mtime, local.size, last.localMtime, last.size, last.md5, local.md5);
-        const remoteChanged = changedSince(
-          remote.mtime,
-          remote.size,
-          last.remoteMtime,
-          last.remoteSize ?? last.size,
-          last.md5,
-          remote.md5
-        );
+        const remoteChanged = isLegacyEmptyRemoteBaseline(last)
+          ? remote.size !== last.size
+          : changedSince(
+              remote.mtime,
+              remote.size,
+              last.remoteMtime,
+              last.remoteSize ?? last.size,
+              last.md5,
+              remote.md5
+            );
 
         if (!localChanged && !remoteChanged) {
           result.skips.push({ path, action: 'skip', local, remote, reason: 'Neither modified since last sync' });
@@ -188,14 +198,16 @@ export function computeDiff(
 
     if (last) {
       // Was previously synced, now missing locally
-      const remoteModified = changedSince(
-        remote.mtime,
-        remote.size,
-        last.remoteMtime,
-        last.remoteSize ?? last.size,
-        last.md5,
-        remote.md5
-      );
+      const remoteModified = isLegacyEmptyRemoteBaseline(last)
+        ? remote.size !== last.size
+        : changedSince(
+            remote.mtime,
+            remote.size,
+            last.remoteMtime,
+            last.remoteSize ?? last.size,
+            last.md5,
+            remote.md5
+          );
 
       if (!remoteModified) {
         // Deleted locally, remote unchanged -> delete on remote

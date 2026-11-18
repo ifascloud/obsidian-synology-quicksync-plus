@@ -172,8 +172,8 @@ var QuickConnectResolver = class {
         if (info) {
           const directCandidates = [];
           for (const ip of info.lanIps) {
-            directCandidates.push(`http://${ip}:${info.httpPort}`);
             directCandidates.push(`https://${ip}:${info.httpsPort}`);
+            directCandidates.push(`http://${ip}:${info.httpPort}`);
           }
           if (info.smartDnsLan) {
             for (const lanHost of info.smartDnsLan) {
@@ -536,7 +536,8 @@ var SynologyApiClient = class {
     const limit = 1e3;
     const allRawFiles = [];
     while (true) {
-      const url = `${this.baseUrl}/webapi/entry.cgi?api=SYNO.FileStation.List&version=2&method=list&folder_path=${encodeURIComponent(folderToQuery)}&offset=${offset}&limit=${limit}&additional=time,size,md5&_sid=${this.sid}`;
+      const additionalParam = encodeURIComponent('["time","size"]');
+      const url = `${this.baseUrl}/webapi/entry.cgi?api=SYNO.FileStation.List&version=2&method=list&folder_path=${encodeURIComponent(folderToQuery)}&offset=${offset}&limit=${limit}&additional=${additionalParam}&_sid=${encodeURIComponent(this.sid)}`;
       const res = await this.http({ url, method: "GET" });
       const json = res.json;
       if (!json || !json.success) {
@@ -593,11 +594,11 @@ var SynologyApiClient = class {
     const safeFileName = fileName.replace(/[\r\n]/g, "").replace(/"/g, '\\"');
     let mtimePart = "";
     if (typeof mtimeMs === "number" && mtimeMs > 0) {
-      const sec = Math.floor(mtimeMs > 1e10 ? mtimeMs / 1e3 : mtimeMs);
+      const ms = Math.floor(mtimeMs > 1e10 ? mtimeMs : mtimeMs * 1e3);
       mtimePart = `--${boundary}\r
 Content-Disposition: form-data; name="mtime"\r
 \r
-${sec}\r
+${ms}\r
 `;
     }
     const encoder = new TextEncoder();
@@ -762,6 +763,9 @@ function changedSince(mtime, size, lastMtime, lastSize, lastMd5, md5) {
   const sizeChanged = lastSize === void 0 ? false : size !== lastSize;
   return !sameMtime(mtime, lastMtime) || sizeChanged;
 }
+function isLegacyEmptyRemoteBaseline(last) {
+  return last.remoteMtime === 0 && (last.remoteSize ?? 0) === 0;
+}
 function computeDiff(localFiles, remoteFiles, ignorePatterns, lastSyncIndex) {
   const result = {
     uploads: [],
@@ -804,7 +808,7 @@ function computeDiff(localFiles, remoteFiles, ignorePatterns, lastSyncIndex) {
       }
       if (last) {
         const localChanged = changedSince(local.mtime, local.size, last.localMtime, last.size, last.md5, local.md5);
-        const remoteChanged = changedSince(
+        const remoteChanged = isLegacyEmptyRemoteBaseline(last) ? remote.size !== last.size : changedSince(
           remote.mtime,
           remote.size,
           last.remoteMtime,
@@ -849,7 +853,7 @@ function computeDiff(localFiles, remoteFiles, ignorePatterns, lastSyncIndex) {
       continue;
     const last = lastSyncIndex?.[path];
     if (last) {
-      const remoteModified = changedSince(
+      const remoteModified = isLegacyEmptyRemoteBaseline(last) ? remote.size !== last.size : changedSince(
         remote.mtime,
         remote.size,
         last.remoteMtime,
@@ -1381,6 +1385,22 @@ var SynologySyncPlugin = class extends import_obsidian2.Plugin {
       );
       const report = await manager.executeSync(diff);
       if (report.updatedIndex) {
+        const activePaths = /* @__PURE__ */ new Set();
+        for (const f of localFiles)
+          activePaths.add(f.path);
+        for (const f of remoteFiles) {
+          if (!f.isdir)
+            activePaths.add(f.path);
+        }
+        for (const item of diff.uploads)
+          activePaths.add(item.path);
+        for (const item of diff.downloads)
+          activePaths.add(item.path);
+        for (const key of Object.keys(report.updatedIndex)) {
+          if (!activePaths.has(key)) {
+            delete report.updatedIndex[key];
+          }
+        }
         this.syncIndex = report.updatedIndex;
         await this.saveSettings();
       }
